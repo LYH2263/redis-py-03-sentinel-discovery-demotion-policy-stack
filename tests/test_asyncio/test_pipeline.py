@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from unittest import mock
 
 import pytest
@@ -10,10 +11,21 @@ from .compat import aclosing
 from .conftest import wait_for_command
 
 from unittest.mock import MagicMock, patch, AsyncMock
+
+from redis._parsers.encoders import Encoder
 from redis.asyncio.client import Pipeline
 from redis.asyncio.observability import recorder as async_recorder
+from redis.commands.core import AsyncScript
 from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
+from redis.pipeline_policy import (
+    EffectivePipelinePolicy,
+    ExecMode,
+    ScriptPreload,
+    StackEmptyMode,
+    WatchDispatch,
+    WatchFault,
+)
 
 
 class TestPipeline:
@@ -812,3 +824,445 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
             self.operation_duration.record.assert_not_called()
 
         async_recorder.reset_collector()
+
+
+class _AsyncFakeRetry:
+    """Zero-retry async Retry: await the callable once, await the failure
+    callback on a connection error, then surface the original error."""
+
+    def get_retries(self):
+        return 0
+
+    async def call_with_retry(
+        self, do, fail, is_retryable=None, with_failure_count=False
+    ):
+        try:
+            return await do()
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as error:
+            outcome = fail(error, 1) if with_failure_count else fail(error)
+            if inspect.isawaitable(outcome):
+                await outcome
+            raise
+
+
+class AsyncFakePolicyConnection:
+    """In-memory async connection for policy-stack tests (no socket)."""
+
+    def __init__(self, responses=(), fail_command_names=(), fail_packed=False):
+        self.host = "localhost"
+        self.port = 6379
+        self.db = 0
+        self.retry = _AsyncFakeRetry()
+        self._responses = list(responses)
+        self._fail_command_names = set(fail_command_names)
+        self._fail_packed = fail_packed
+        self.immediate = []
+        self.packs = []
+        self.disconnects = 0
+
+    def pack_commands(self, args):
+        batch = list(args)
+        self.packs.append(batch)
+        return batch
+
+    async def send_packed_command(self, packed):
+        if self._fail_packed:
+            raise redis.ConnectionError("boom on packed write")
+
+    async def send_command(self, *args, **kwargs):
+        self.immediate.append(args)
+        if args[0] in self._fail_command_names:
+            raise redis.ConnectionError(f"boom on {args[0]}")
+
+    async def read_response(self, *args, **kwargs):
+        return self._responses.pop(0)
+
+    async def disconnect(self, *args, **kwargs):
+        self.disconnects += 1
+
+    def _close(self, *args, **kwargs):
+        pass
+
+
+class AsyncFakePolicyPool:
+    def __init__(self, connection):
+        self.connection = connection
+        self.released = []
+
+    async def get_connection(self, *args, **kwargs):
+        return self.connection
+
+    async def release(self, connection):
+        self.released.append(connection)
+
+    def get_encoder(self):
+        return Encoder(
+            encoding="utf-8",
+            encoding_errors="strict",
+            decode_responses=False,
+        )
+
+
+def make_async_policy_pipeline(transaction=True, conn=None):
+    conn = conn or AsyncFakePolicyConnection()
+    pool = AsyncFakePolicyPool(conn)
+    return Pipeline(pool, {}, transaction, None), conn, pool
+
+
+def async_packed_names(conn):
+    return [args[0] for args in conn.packs[-1]]
+
+
+def async_immediate_names(conn):
+    return [args[0] for args in conn.immediate]
+
+
+class TestAsyncPipelinePolicyStack:
+    """Serverless tests for the asyncio Pipeline policy stack."""
+
+    async def test_empty_stack_matches_pin(self):
+        pipe, conn, pool = make_async_policy_pipeline()
+        assert pipe.pipeline_policy_profile == EffectivePipelinePolicy.merge([])
+        profile = pipe.pipeline_policy_profile
+        assert profile.route_multi_exec(True, False) is True
+        assert profile.route_multi_exec(False, False) is False
+        assert profile.dispatch_immediately(True, "GET", False) is True
+        assert profile.dispatch_immediately(False, "WATCH", False) is True
+        assert profile.dispatch_immediately(False, "WATCH", True) is False
+        assert profile.preload_scripts is True
+        assert profile.script_buffering_forbidden is False
+        assert profile.raise_watch_error_on_break is True
+        assert profile.reraise_connection_errors is False
+        assert profile.release_connection_on_empty is False
+        assert profile.execute_forbidden is False
+        assert profile.watch_forbidden is False
+
+    async def test_multi_exec_frame_packs_multi_exec(self):
+        conn = AsyncFakePolicyConnection(
+            [b"OK", b"QUEUED", b"QUEUED", [True, b"v"]]
+        )
+        pipe, conn, pool = make_async_policy_pipeline(
+            transaction=False, conn=conn
+        )
+        async with pipe.push_pipeline_policy(exec_mode=ExecMode.MULTI_EXEC):
+            pipe.set("a", 1).get("a")
+            assert await pipe.execute() == [True, b"v"]
+        assert async_packed_names(conn) == ["MULTI", "SET", "GET", "EXEC"]
+
+    async def test_bare_pipeline_frame_omits_multi_exec(self):
+        conn = AsyncFakePolicyConnection([True, b"v"])
+        pipe, conn, pool = make_async_policy_pipeline(
+            transaction=True, conn=conn
+        )
+        async with pipe.push_pipeline_policy(exec_mode=ExecMode.BARE_PIPELINE):
+            pipe.set("a", 1).get("a")
+            assert await pipe.execute() == [True, b"v"]
+        assert async_packed_names(conn) == ["SET", "GET"]
+
+    async def test_forbid_execute_frame_blocks_execute(self):
+        conn = AsyncFakePolicyConnection()
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        async with pipe.push_pipeline_policy(
+            exec_mode=ExecMode.FORBID_EXECUTE
+        ):
+            pipe.set("a", 1)
+            with pytest.raises(redis.PipelinePolicyError):
+                await pipe.execute()
+        assert conn.packs == []
+        assert pool.released == []
+
+    async def test_watch_is_immediate_under_immediate_pre_multi(self):
+        conn = AsyncFakePolicyConnection(
+            [b"OK", b"v", b"OK", b"QUEUED", [True]]
+        )
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        async with pipe.push_pipeline_policy(
+            watch_dispatch=WatchDispatch.IMMEDIATE_PRE_MULTI
+        ):
+            await pipe.watch("x")
+            assert async_immediate_names(conn) == ["WATCH"]
+            assert pipe.command_stack == []
+            assert pipe.watching is True
+            assert await pipe.get("a") == b"v"
+            assert async_immediate_names(conn) == ["WATCH", "GET"]
+            pipe.multi()
+            pipe.set("a", 2)
+            assert await pipe.execute() == [True]
+        assert async_packed_names(conn) == ["MULTI", "SET", "EXEC"]
+
+    async def test_watch_is_buffered_under_stack_after_multi(self):
+        conn = AsyncFakePolicyConnection([b"OK", b"OK"])
+        pipe, conn, pool = make_async_policy_pipeline(
+            transaction=False, conn=conn
+        )
+        async with pipe.push_pipeline_policy(
+            watch_dispatch=WatchDispatch.STACK_AFTER_MULTI
+        ):
+            await pipe.watch("x")
+            assert async_immediate_names(conn) == []
+            assert pipe.command_stack[0][0] == ("WATCH", "x")
+            assert pipe.watching is False
+            assert await pipe.execute() == [b"OK"]
+        assert async_packed_names(conn) == ["WATCH"]
+
+    async def test_watching_read_buffers_under_stack_after_multi(self):
+        conn = AsyncFakePolicyConnection()
+        pipe, conn, pool = make_async_policy_pipeline(
+            transaction=False, conn=conn
+        )
+        pipe.watching = True
+        async with pipe.push_pipeline_policy(
+            watch_dispatch=WatchDispatch.STACK_AFTER_MULTI
+        ):
+            pipe.get("a")
+        assert async_immediate_names(conn) == []
+        assert pipe.command_stack[0][0] == ("GET", "a")
+
+    async def test_forbid_watch_frame(self):
+        conn = AsyncFakePolicyConnection()
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        async with pipe.push_pipeline_policy(
+            watch_dispatch=WatchDispatch.FORBID_WATCH
+        ):
+            with pytest.raises(redis.PipelinePolicyError):
+                await pipe.watch("x")
+            with pytest.raises(redis.PipelinePolicyError):
+                pipe.execute_command("WATCH", "x")
+            pipe.set("a", 1)
+            assert pipe.command_stack[0][0] == ("SET", "a", 1)
+        assert async_immediate_names(conn) == []
+
+    async def test_script_preload_exists_then_load_immediate_not_in_multi_stack(
+        self,
+    ):
+        conn = AsyncFakePolicyConnection(
+            [[0], "fake-sha", b"OK", b"QUEUED", [42]]
+        )
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        script = AsyncScript(pipe, "return 42")
+        async with pipe.push_pipeline_policy(
+            script_preload=ScriptPreload.EXISTS_THEN_LOAD
+        ):
+            await script(keys=[], args=[], client=pipe)
+            assert await pipe.execute() == [42]
+            assert len(pipe.pipeline_policy_stack) == 1
+        assert async_immediate_names(conn) == ["SCRIPT EXISTS", "SCRIPT LOAD"]
+        assert async_packed_names(conn) == ["MULTI", "EVALSHA", "EXEC"]
+
+    async def test_script_skip_preload_frame_skips_exists_load(self):
+        conn = AsyncFakePolicyConnection([b"OK", b"QUEUED", [42]])
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        script = AsyncScript(pipe, "return 42")
+        async with pipe.push_pipeline_policy(
+            script_preload=ScriptPreload.SKIP_PRELOAD
+        ):
+            await script(keys=[], args=[], client=pipe)
+            assert await pipe.execute() == [42]
+        assert async_immediate_names(conn) == []
+        assert async_packed_names(conn) == ["MULTI", "EVALSHA", "EXEC"]
+
+    async def test_forbid_buffer_script_blocks_buffering_and_preloads(self):
+        conn = AsyncFakePolicyConnection()
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        async with pipe.push_pipeline_policy(
+            script_preload=ScriptPreload.FORBID_BUFFER_SCRIPT
+        ):
+            with pytest.raises(redis.PipelinePolicyError):
+                pipe.pipeline_execute_command("SCRIPT LOAD", "return 1")
+            with pytest.raises(redis.PipelinePolicyError):
+                pipe.execute_command("SCRIPT EXISTS", "sha")
+            assert pipe.command_stack == []
+        pipe.pipeline_execute_command("SCRIPT LOAD", "return 1")
+        assert pipe.command_stack[0][0] == ("SCRIPT LOAD", "return 1")
+
+        conn2 = AsyncFakePolicyConnection(
+            [[0], "fake-sha", b"OK", b"QUEUED", [42]]
+        )
+        pipe2, conn2, pool2 = make_async_policy_pipeline(conn=conn2)
+        script = AsyncScript(pipe2, "return 42")
+        async with pipe2.push_pipeline_policy(
+            script_preload=ScriptPreload.FORBID_BUFFER_SCRIPT
+        ):
+            await script(keys=[], args=[], client=pipe2)
+            assert await pipe2.execute() == [42]
+        assert async_immediate_names(conn2) == ["SCRIPT EXISTS", "SCRIPT LOAD"]
+        assert async_packed_names(conn2) == ["MULTI", "EVALSHA", "EXEC"]
+
+    async def test_exec_none_raises_watch_error(self):
+        conn = AsyncFakePolicyConnection([b"OK", b"QUEUED", None])
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        pipe.set("a", 1)
+        with pytest.raises(redis.WatchError):
+            await pipe.execute()
+        assert pool.released == [conn]
+
+    async def test_immediate_break_while_watching_raises_watch_error(self):
+        conn = AsyncFakePolicyConnection(
+            [b"OK", b"OK"], fail_command_names=("GET",)
+        )
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        await pipe.watch("x")
+        with pytest.raises(redis.WatchError):
+            await pipe.get("a")
+        assert conn.disconnects == 1
+        assert async_immediate_names(conn) == ["WATCH", "GET", "UNWATCH"]
+        assert pool.released == [conn]
+
+    async def test_immediate_break_reraises_raw_connection_error(self):
+        conn = AsyncFakePolicyConnection(
+            [b"OK", b"OK"], fail_command_names=("GET",)
+        )
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        await pipe.watch("x")
+        async with pipe.push_pipeline_policy(
+            watch_fault=WatchFault.RERAISE_CONNECTION
+        ):
+            with pytest.raises(redis.ConnectionError):
+                await pipe.get("a")
+        assert conn.disconnects == 1
+        assert async_immediate_names(conn) == ["WATCH", "GET"]
+        assert pool.released == []
+        # the frame intentionally keeps the connection; clean up for GC
+        pipe.connection = None
+
+    async def test_execute_break_while_watching_raises_watch_error(self):
+        conn = AsyncFakePolicyConnection([b"OK", b"OK"], fail_packed=True)
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        await pipe.watch("x")
+        pipe.multi()
+        pipe.set("a", 1)
+        with pytest.raises(redis.WatchError):
+            await pipe.execute()
+        assert conn.disconnects == 1
+        assert async_immediate_names(conn) == ["WATCH", "UNWATCH"]
+        assert pool.released == [conn]
+
+    async def test_execute_break_reraises_raw_connection_error(self):
+        conn = AsyncFakePolicyConnection([b"OK", b"OK"], fail_packed=True)
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        await pipe.watch("x")
+        pipe.multi()
+        pipe.set("a", 1)
+        async with pipe.push_pipeline_policy(
+            watch_fault=WatchFault.RERAISE_CONNECTION
+        ):
+            with pytest.raises(redis.ConnectionError):
+                await pipe.execute()
+        assert conn.disconnects == 1
+        assert pool.released == [conn]
+
+    async def test_reset_unwatch_error_reraised_under_reraise_frame(self):
+        conn = AsyncFakePolicyConnection(fail_command_names=("UNWATCH",))
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        pipe.watching = True
+        pipe.connection = conn
+        # historical behavior: reset() swallows the connection error
+        await pipe.reset()
+        assert conn.disconnects == 1
+        assert pool.released == [conn]
+
+        conn2 = AsyncFakePolicyConnection(fail_command_names=("UNWATCH",))
+        pipe2, conn2, pool2 = make_async_policy_pipeline(conn=conn2)
+        pipe2.watching = True
+        pipe2.connection = conn2
+        async with pipe2.push_pipeline_policy(
+            watch_fault=WatchFault.RERAISE_CONNECTION
+        ):
+            with pytest.raises(redis.ConnectionError):
+                await pipe2.reset()
+        assert conn2.disconnects == 1
+        # async reset still releases the connection from its finally block
+        assert pool2.released == [conn2]
+
+    async def test_empty_stack_short_circuit_vs_require_noop_reset(self):
+        conn = AsyncFakePolicyConnection()
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        pipe.connection = conn
+        assert await pipe.execute() == []
+        assert pool.released == []
+        async with pipe.push_pipeline_policy(
+            stack_empty=StackEmptyMode.SHORT_CIRCUIT
+        ):
+            assert await pipe.execute() == []
+        assert pool.released == []
+        assert pipe.connection is conn
+        pipe.connection = None  # cleanup for GC
+
+        conn2 = AsyncFakePolicyConnection()
+        pipe2, conn2, pool2 = make_async_policy_pipeline(conn=conn2)
+        pipe2.connection = conn2
+        async with pipe2.push_pipeline_policy(
+            stack_empty=StackEmptyMode.REQUIRE_NOOP_RESET
+        ):
+            assert await pipe2.execute() == []
+        assert pool2.released == [conn2]
+        assert pipe2.connection is None
+
+    async def test_nested_frames_change_behavior_and_restore_outer(self):
+        conn = AsyncFakePolicyConnection(
+            [True, b"OK", b"QUEUED", b"QUEUED", [True, b"v"]]
+        )
+        pipe, conn, pool = make_async_policy_pipeline(
+            transaction=True, conn=conn
+        )
+        async with pipe.push_pipeline_policy(exec_mode=ExecMode.MULTI_EXEC):
+            async with pipe.push_pipeline_policy(
+                exec_mode=ExecMode.BARE_PIPELINE
+            ):
+                pipe.set("a", 1)
+                assert await pipe.execute() == [True]
+                assert async_packed_names(conn) == ["SET"]
+            assert pipe.pipeline_policy_profile.exec_mode is ExecMode.MULTI_EXEC
+            pipe.set("a", 1).get("a")
+            assert await pipe.execute() == [True, b"v"]
+            assert async_packed_names(conn) == ["MULTI", "SET", "GET", "EXEC"]
+        assert len(pipe.pipeline_policy_stack) == 0
+        assert pipe.pipeline_policy_profile == EffectivePipelinePolicy.merge([])
+
+    async def test_frame_pops_cleanly_on_exception_and_survives_reset(self):
+        conn = AsyncFakePolicyConnection([b"OK"])
+        pipe, conn, pool = make_async_policy_pipeline(
+            transaction=False, conn=conn
+        )
+        with pytest.raises(ValueError):
+            async with pipe.push_pipeline_policy(
+                watch_dispatch=WatchDispatch.STACK_AFTER_MULTI
+            ):
+                raise ValueError("middleware boom")
+        assert len(pipe.pipeline_policy_stack) == 0
+
+        async with pipe.push_pipeline_policy(
+            watch_dispatch=WatchDispatch.STACK_AFTER_MULTI
+        ):
+            await pipe.watch("x")
+            assert pipe.command_stack[0][0] == ("WATCH", "x")
+            await pipe.reset()
+            # reset() must not pop middleware frames
+            assert len(pipe.pipeline_policy_stack) == 1
+
+    async def test_executor_guards_disagree_with_frame(self):
+        conn = AsyncFakePolicyConnection()
+        pipe, conn, pool = make_async_policy_pipeline(conn=conn)
+        commands = [(("SET", "a", 1), {})]
+        async with pipe.push_pipeline_policy(exec_mode=ExecMode.BARE_PIPELINE):
+            with pytest.raises(redis.PipelinePolicyError):
+                await pipe._execute_transaction(conn, commands, True)
+        async with pipe.push_pipeline_policy(exec_mode=ExecMode.MULTI_EXEC):
+            with pytest.raises(redis.PipelinePolicyError):
+                await pipe._execute_pipeline(conn, commands, True)
+        async with pipe.push_pipeline_policy(exec_mode=ExecMode.BARE_PIPELINE):
+            pipe.execute_command("MULTI")
+            with pytest.raises(redis.PipelinePolicyError):
+                await pipe.execute()
+
+    async def test_two_pipelines_do_not_share_stack(self):
+        pipe_a, conn_a, pool_a = make_async_policy_pipeline()
+        pipe_b, conn_b, pool_b = make_async_policy_pipeline()
+        async with pipe_a.push_pipeline_policy(
+            exec_mode=ExecMode.FORBID_EXECUTE
+        ):
+            assert pipe_b.pipeline_policy_profile == EffectivePipelinePolicy.merge(
+                []
+            )
+            assert pipe_b.pipeline_policy_profile.execute_forbidden is False
+            assert pipe_a.pipeline_policy_profile.execute_forbidden is True

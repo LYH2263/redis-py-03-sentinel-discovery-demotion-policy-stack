@@ -70,6 +70,17 @@ class WatchError(RedisError):
     pass
 
 
+class PipelinePolicyError(RedisError):
+    """
+    Raised when a command or execution violates the profile that is currently
+    pushed on a Pipeline's policy stack (e.g. execute() under a
+    ``forbid_execute`` frame, WATCH under ``forbid_watch``, or buffering
+    SCRIPT EXISTS/LOAD under ``forbid_buffer_script``).
+    """
+
+    pass
+
+
 class NoScriptError(ResponseError):
     pass
 

@@ -77,6 +77,7 @@ from redis.event import (
 from redis.exceptions import (
     ConnectionError,
     ExecAbortError,
+    PipelinePolicyError,
     PubSubError,
     RedisError,
     ResponseError,
@@ -85,6 +86,11 @@ from redis.exceptions import (
 from redis.himport import HImportRegistry, parse_himport_set_args
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.observability.attributes import PubSubDirection
+from redis.pipeline_policy import (
+    EffectivePipelinePolicy,
+    PipelinePolicyFrame,
+    PipelinePolicyStack,
+)
 from redis.typing import (
     ChannelT,
     EncodableT,
@@ -1823,6 +1829,22 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         self.command_stack: CommandStackT = []
         self.scripts: Set[Script] = set()
         self.explicit_transaction = False
+        # Instance-local, resettable policy profile stack. Never shared with
+        # another Pipeline and never cleared by reset().
+        self.pipeline_policy_stack = PipelinePolicyStack()
+
+    def push_pipeline_policy(self, **kwargs: Any) -> PipelinePolicyFrame:
+        """
+        Push a transaction/watch/script-preload profile frame onto this
+        Pipeline's policy stack. Returns the frame, which works as a sync or
+        async context manager and can also be popped explicitly.
+        """
+        return self.pipeline_policy_stack.push(**kwargs)
+
+    @property
+    def pipeline_policy_profile(self) -> EffectivePipelinePolicy:
+        """Merged read-only view of the active transaction/watch policy stack."""
+        return self.pipeline_policy_stack.profile
 
     async def __aenter__(self: _RedisT) -> _RedisT:
         return self
@@ -1861,6 +1883,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                     # disconnect will also remove any previous WATCHes
                     if self.connection:
                         await self.connection.disconnect()
+                    # a reraise_connection frame keeps the connection error type
+                    # instead of having reset() swallow it silently.
+                    if self.pipeline_policy_stack.profile.reraise_connection_errors:
+                        raise
                 except asyncio.CancelledError:
                     # Disconnect so any unread UNWATCH reply does not get
                     # served to the next caller that takes the connection.
@@ -1901,7 +1927,14 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     def execute_command(
         self, *args, **kwargs
     ) -> Union["Pipeline", Awaitable["Pipeline"]]:
-        if (self.watching or args[0] == "WATCH") and not self.explicit_transaction:
+        profile = self.pipeline_policy_stack.profile
+        if args[0] == "WATCH" and profile.watch_forbidden:
+            raise PipelinePolicyError(
+                "WATCH is forbidden by the active pipeline policy (forbid_watch)"
+            )
+        if profile.dispatch_immediately(
+            self.watching, args[0], self.explicit_transaction
+        ):
             return self.immediate_execute_command(*args, **kwargs)
         return self.pipeline_execute_command(*args, **kwargs)
 
@@ -1942,10 +1975,13 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         # valid since this connection has died. raise a WatchError, which
         # indicates the user should retry this transaction.
         if self.watching:
-            await self.reset()
-            raise WatchError(
-                f"A {type(error).__name__} occurred while watching one or more keys"
-            )
+            if self.pipeline_policy_stack.profile.raise_watch_error_on_break:
+                await self.reset()
+                raise WatchError(
+                    f"A {type(error).__name__} occurred while watching one or more keys"
+                )
+            # reraise_connection: don't reset or raise WatchError here; let the
+            # original connection error propagate (and retry) with its own type.
 
     async def immediate_execute_command(self, *args, **options):
         """
@@ -2015,6 +2051,15 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         At some other point, you can then run: pipe.execute(),
         which will execute all commands queued in the pipe.
         """
+        if (
+            args[0] in ("SCRIPT EXISTS", "SCRIPT LOAD")
+            and self.pipeline_policy_stack.profile.script_buffering_forbidden
+        ):
+            raise PipelinePolicyError(
+                "SCRIPT EXISTS/SCRIPT LOAD must be issued immediately "
+                "(forbid_buffer_script); they cannot be buffered on the "
+                "command stack"
+            )
         self.command_stack.append((args, options))
         return self
 
@@ -2025,6 +2070,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     async def _execute_transaction(  # noqa: C901
         self, connection: Connection, commands: CommandStackT, raise_on_error
     ):
+        # The active exec_mode must agree with the MULTI/EXEC shape packed here.
+        self.pipeline_policy_stack.profile.ensure_executor(True, commands)
         # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
         # connection before the MULTI/EXEC block (session state, not transactional).
         await self._himport_prepare_pipeline(connection, commands)
@@ -2106,6 +2153,9 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     async def _execute_pipeline(
         self, connection: Connection, commands: CommandStackT, raise_on_error: bool
     ):
+        # No MULTI/EXEC may be packed while a bare_pipeline (or narrower) frame is
+        # active, even if this executor is reached directly.
+        self.pipeline_policy_stack.profile.ensure_executor(False, commands)
         # Fold any first-use HIMPORT PREPAREs for referenced fieldsets into the same
         # packed write as the queued commands, so a pipeline that lands on a fresh or
         # reconnected connection stays a single round trip (the batched write bypasses
@@ -2172,6 +2222,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         return result
 
     async def load_scripts(self):
+        if not self.pipeline_policy_stack.profile.preload_scripts:
+            # skip_preload: scripts go to the wire as EVALSHA without any
+            # immediate SCRIPT EXISTS/SCRIPT LOAD preamble.
+            return
         # make sure all scripts that are about to be run on this pipeline exist
         scripts = list(self.scripts)
         immediate = self.immediate_execute_command
@@ -2219,19 +2273,33 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         # if we were watching a variable, the watch is no longer valid
         # since this connection has died. raise a WatchError, which
         # indicates the user should retry this transaction.
-        if self.watching:
+        if (
+            self.watching
+            and self.pipeline_policy_stack.profile.raise_watch_error_on_break
+        ):
             raise WatchError(
                 f"A {type(error).__name__} occurred while watching one or more keys"
             )
+        # under reraise_connection the failure callback returns without a
+        # WatchError so retry runs its course and the original error surfaces
 
     async def execute(self, raise_on_error: bool = True) -> List[Any]:
         """Execute all the commands in the current pipeline"""
+        profile = self.pipeline_policy_stack.profile
+        if profile.execute_forbidden:
+            raise PipelinePolicyError(
+                "execute() is forbidden by the active pipeline policy (forbid_execute)"
+            )
         stack = self.command_stack
         if not stack and not self.watching:
+            if self.connection and profile.release_connection_on_empty:
+                # require_noop_reset: a held connection must still be given
+                # back to the pool even though nothing is executed
+                await self.reset()
             return []
-        if self.scripts:
+        if self.scripts and profile.preload_scripts:
             await self.load_scripts()
-        if self.is_transaction or self.explicit_transaction:
+        if profile.route_multi_exec(self.is_transaction, self.explicit_transaction):
             execute = self._execute_transaction
             operation_name = "MULTI"
         else:
